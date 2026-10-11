@@ -2,6 +2,12 @@
 
 A native macOS app for sending files from your Mac to your phone over the local network: the same Wi‑Fi, or the Mac connected to your phone's hotspot. Every shared file gets one link and one QR code, and each link can be switched on or off.
 
+<p align="center">
+  <img src="docs/app.png" alt="Fast Share on the Mac: shared files in the sidebar, and the selected file's QR code, link and on/off switch" width="580">
+  <img src="docs/phone.png" alt="The page a phone opens after scanning the QR code, with Download and Open buttons" width="220">
+</p>
+<p align="center"><sub>The Mac app, and the page your phone opens after scanning the QR code.</sub></p>
+
 ## Build
 
 Requires macOS 14 or later and a Swift 6 toolchain (Xcode, or just the Command Line Tools: `xcode-select --install`).
