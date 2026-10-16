@@ -119,7 +119,7 @@ private struct ShareDetailView: View {
 
     @ViewBuilder
     private func caption(linkState: LinkState, isMissing: Bool) -> some View {
-        let transfers = store.activeTransfers[file.id] ?? 0
+        let devices = store.activeDevices[file.id] ?? 0
         if store.isZipping(file.id) {
             HStack(spacing: 6) {
                 ProgressView().controlSize(.small)
@@ -127,10 +127,10 @@ private struct ShareDetailView: View {
             }
             .font(.system(size: 12, weight: .medium))
             .foregroundStyle(Theme.accent)
-        } else if transfers > 0 {
+        } else if devices > 0 {
             HStack(spacing: 6) {
                 ProgressView().controlSize(.small)
-                Text(transfers == 1 ? "Sending to a device…" : "Sending to \(transfers) devices…")
+                Text(devices == 1 ? "Sending to a device…" : "Sending to \(devices) devices…")
             }
             .font(.system(size: 12, weight: .medium))
             .foregroundStyle(Theme.accent)

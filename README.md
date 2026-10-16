@@ -32,6 +32,7 @@ scripts/test.sh                 # runs the tests
 ## How it works
 
 - `Sources/FastShareCore` is a small HTTP/1.1 server built on Network.framework. It listens on every interface on port 8642, falling back to 8643–8660 and then any free port. It streams files in 1 MB chunks and supports `Range` requests (video seeking, resumed downloads), `HEAD`, and keep-alive.
+- "Sending to N devices" counts devices by their network address, not connections: Chrome on Android splits every large download into three parallel connections. A download counts once a device has received every byte of the file, however many requests that took, including downloads resumed later.
 - Links look like `http://<mac-ip>:8642/<token>`. The token is 10 random characters (about 49 bits), so nobody else can guess it.
 - `Sources/FastShare` is the app itself: an AppKit window that hosts SwiftUI views, with a forced light appearance.
 - Your shares are saved in `~/Library/Application Support/Fast Share/shares.json`. Zips of shared folders are kept next to it in `Archives/` until you remove their link.

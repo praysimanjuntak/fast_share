@@ -64,6 +64,9 @@ final class HTTPConnection: @unchecked Sendable {
     private let connection: NWConnection
     private let context: HTTPServer.Context
     private let onClose: @Sendable (ObjectIdentifier) -> Void
+    /// The device on the other end: its address without the port, so all of a phone's connections
+    /// count as one device.
+    private let client: String
     private let queue = DispatchQueue(label: "app.fastshare.connection")
 
     private var buffer: [UInt8] = []
@@ -73,10 +76,10 @@ final class HTTPConnection: @unchecked Sendable {
     private var transfer: Transfer?
 
     private struct Transfer {
-        let token: String
+        let id: TransferTracker.TransferID
         let file: FileHandle
-        let countsAsDownload: Bool
         let keepAlive: Bool
+        var offset: UInt64
         var remaining: UInt64
     }
 
@@ -89,6 +92,11 @@ final class HTTPConnection: @unchecked Sendable {
         self.connection = connection
         self.context = context
         self.onClose = onClose
+        if case .hostPort(let host, _) = connection.endpoint {
+            client = host.debugDescription
+        } else {
+            client = connection.endpoint.debugDescription
+        }
     }
 
     func start() {
@@ -243,9 +251,8 @@ final class HTTPConnection: @unchecked Sendable {
             close()
             return
         }
-        transfer = Transfer(token: token, file: file.handle, countsAsDownload: status == .ok,
-                            keepAlive: keepAlive, remaining: length)
-        context.emit(.transferStarted(token: token))
+        let id = context.transfers.begin(token: token, client: client, fileVersion: file.etag, fileSize: file.size)
+        transfer = Transfer(id: id, file: file.handle, keepAlive: keepAlive, offset: start, remaining: length)
         connection.send(content: head, completion: .contentProcessed { [weak self] error in
             guard let self else { return }
             if error != nil {
@@ -262,7 +269,7 @@ final class HTTPConnection: @unchecked Sendable {
         guard !closed, var transfer else { return }
         if transfer.remaining == 0 {
             self.transfer = nil
-            context.emit(.transferFinished(token: transfer.token, completedFile: transfer.countsAsDownload))
+            context.transfers.end(transfer.id)
             finishResponse(keepAlive: transfer.keepAlive)
             return
         }
@@ -277,8 +284,11 @@ final class HTTPConnection: @unchecked Sendable {
             close() // The file shrank mid-transfer; the promised Content-Length can't be met.
             return
         }
+        let sent = transfer.offset..<transfer.offset + UInt64(chunk.count)
+        transfer.offset = sent.upperBound
         transfer.remaining -= UInt64(chunk.count)
         self.transfer = transfer
+        context.transfers.sent(sent, by: transfer.id)
         connection.send(content: chunk, completion: .contentProcessed { [weak self] error in
             guard let self else { return }
             if error != nil {
@@ -337,7 +347,7 @@ final class HTTPConnection: @unchecked Sendable {
         idleTimer = nil
         if let transfer {
             self.transfer = nil
-            context.emit(.transferFinished(token: transfer.token, completedFile: false))
+            context.transfers.end(transfer.id)
         }
         connection.stateUpdateHandler = nil
         connection.cancel()

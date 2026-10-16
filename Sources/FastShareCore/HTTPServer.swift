@@ -11,15 +11,16 @@ public final class HTTPServer: @unchecked Sendable {
     }
 
     public enum Event: Sendable, Equatable {
-        case transferStarted(token: String)
-        /// `completedFile` is true when the entire file went out in a single 200 response.
-        case transferFinished(token: String, completedFile: Bool)
+        /// How many devices are receiving the file right now, however many connections each uses.
+        case devicesChanged(token: String, count: Int)
+        /// A device has now received every byte of the file, over one or more requests.
+        case downloadCompleted(token: String)
     }
 
     struct Context: Sendable {
         let registry: ShareRegistry
         let senderName: String
-        let emit: @Sendable (Event) -> Void
+        let transfers: TransferMonitor
     }
 
     private let context: Context
@@ -39,7 +40,7 @@ public final class HTTPServer: @unchecked Sendable {
         onStateChange: @escaping @Sendable (State) -> Void,
         onEvent: @escaping @Sendable (Event) -> Void
     ) {
-        context = Context(registry: registry, senderName: senderName, emit: onEvent)
+        context = Context(registry: registry, senderName: senderName, transfers: TransferMonitor(emit: onEvent))
         self.onStateChange = onStateChange
     }
 

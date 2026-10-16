@@ -6,7 +6,7 @@ import Testing
 
 /// Drives the server over real sockets with URLSession, the way a phone's browser would.
 struct HTTPServerTests {
-    @Test func downloadsExactBytesAndCountsCompletedDownload() async throws {
+    @Test func downloadsExactBytesAndCountsEachCompleteDownload() async throws {
         let fixture = try await ServerFixture.start()
         defer { fixture.stop() }
         var contents = Data(count: 2_500_000) // several 1 MB chunks
@@ -19,7 +19,54 @@ struct HTTPServerTests {
         #expect(data == contents)
         #expect(response.value(forHTTPHeaderField: "Content-Type") == "application/zip")
         #expect(response.value(forHTTPHeaderField: "Content-Disposition")?.hasPrefix("attachment;") == true)
-        try await fixture.waitUntil("a completed download") { $0.contains(.transferFinished(token: token, completedFile: true)) }
+        try await fixture.waitUntil("a completed download") { $0.contains(.downloadCompleted(token: token)) }
+
+        _ = try await fixture.request("/\(token)/download")
+        try await fixture.waitUntil("a second completed download") {
+            $0.filter { $0 == .downloadCompleted(token: token) }.count == 2
+        }
+    }
+
+    /// Chrome on Android splits a download over three connections at once: a plain GET it abandons
+    /// on reaching the second third of the file, plus range requests for the other two thirds.
+    @Test func phoneSplittingDownloadAcrossConnectionsIsOneDeviceAndOneDownload() async throws {
+        let fixture = try await ServerFixture.start()
+        defer { fixture.stop() }
+        let size = 48 << 20
+        let slice = size / 3
+        let token = try fixture.share(named: "Vibes.apk", size: size)
+        let connections = try (0..<3).map { _ in try RawHTTPClient(host: "127.0.0.1", port: fixture.port) }
+
+        #expect(try connections[0].get("/\(token)/download") == 200)
+        #expect(try connections[1].get("/\(token)/download", range: "bytes=\(slice)-") == 206)
+        #expect(try connections[2].get("/\(token)/download", range: "bytes=\(2 * slice)-") == 206)
+        #expect(fixture.deviceCounts(for: token) == [1]) // All three transfers are under way.
+
+        try connections[0].readBody(slice)
+        connections[0].close()
+        try connections[1].readBody(slice)
+        connections[1].close()
+        try connections[2].readBody(size - 2 * slice)
+        try await fixture.waitUntil("the transfers to end") { $0.last == .devicesChanged(token: token, count: 0) }
+        #expect(fixture.events.filter { $0 == .downloadCompleted(token: token) }.count == 1)
+    }
+
+    @Test func devicesCountSeparatelyAndAbandonedDownloadsDontCount() async throws {
+        let fixture = try await ServerFixture.start()
+        defer { fixture.stop() }
+        let token = try fixture.share(named: "clip.mov", size: 64 << 20)
+        // IPv4 and IPv6 loopback reach the server from two different addresses, like two devices.
+        let phone = try RawHTTPClient(host: "127.0.0.1", port: fixture.port)
+        let laptop = try RawHTTPClient(host: "::1", port: fixture.port)
+
+        #expect(try phone.get("/\(token)/download") == 200)
+        #expect(try laptop.get("/\(token)/download") == 200)
+        #expect(fixture.deviceCounts(for: token) == [1, 2])
+
+        phone.close()
+        laptop.close()
+        try await fixture.waitUntil("the transfers to end") { $0.last == .devicesChanged(token: token, count: 0) }
+        #expect(!fixture.events.contains(.downloadCompleted(token: token)))
     }
 
     @Test func servesSingleByteRanges() async throws {
@@ -47,11 +94,9 @@ struct HTTPServerTests {
             "/\(token)/view", headers: ["Range": "bytes=100-199", "If-Range": "\"stale\""])
         #expect(staleResponse.statusCode == 200)
         #expect(whole == contents)
-        // Only the full 200 response counts as a download; partial responses don't.
-        try await fixture.waitUntil("all transfers finished") { events in
-            events.filter { $0 == .transferFinished(token: token, completedFile: false) }.count == 2
-                && events.contains(.transferFinished(token: token, completedFile: true))
-        }
+        // The partial responses leave gaps, so only the full response completes a download.
+        try await fixture.waitUntil("the transfers to end") { $0.last == .devicesChanged(token: token, count: 0) }
+        #expect(fixture.events.filter { $0 == .downloadCompleted(token: token) }.count == 1)
     }
 
     @Test func blocksInactiveUnknownAndMissingLinks() async throws {
@@ -170,9 +215,34 @@ private final class ServerFixture {
     func share(named name: String, contents: Data) throws -> String {
         let url = directory.appending(path: name)
         try contents.write(to: url)
+        return register(url)
+    }
+
+    /// Shares `size` zero bytes without writing them: a file big enough that transfers stay under
+    /// way while a test holds connections open without reading.
+    func share(named name: String, size: Int) throws -> String {
+        let url = directory.appending(path: name)
+        guard FileManager.default.createFile(atPath: url.path, contents: nil) else {
+            throw FixtureError(description: "couldn't create \(name)")
+        }
+        let handle = try FileHandle(forWritingTo: url)
+        try handle.truncate(atOffset: UInt64(size))
+        try handle.close()
+        return register(url)
+    }
+
+    private func register(_ url: URL) -> String {
         let token = ShareToken.generate()
         update { $0.append(ServedFile(token: token, fileURL: url, isActive: true)) }
         return token
+    }
+
+    /// Every device count the server reported for `token`, in order.
+    func deviceCounts(for token: String) -> [Int] {
+        events.compactMap { event in
+            guard case .devicesChanged(let eventToken, let count) = event, eventToken == token else { return nil }
+            return count
+        }
     }
 
     func setActive(_ isActive: Bool, token: String) {
@@ -201,8 +271,7 @@ private final class ServerFixture {
         return (data, try #require(response as? HTTPURLResponse))
     }
 
-    /// The server reports a transfer once the last byte is handed to the network, which can be a
-    /// moment after the client has read it.
+    /// Some events follow the last byte being handed to the network, a moment after the client read it.
     func waitUntil(_ description: String, timeout: Duration = .seconds(3),
                    _ condition: ([HTTPServer.Event]) -> Bool) async throws {
         let deadline = ContinuousClock.now + timeout
@@ -242,5 +311,82 @@ private final class PortBlocker {
 
     deinit {
         Darwin.close(descriptor)
+    }
+}
+
+/// A bare HTTP client on a blocking socket, so a test decides exactly how much of a response to read
+/// and when to hang up, like a browser abandoning one slice of a split download.
+private final class RawHTTPClient {
+    private var descriptor: Int32
+    private var buffered: [UInt8] = []
+
+    init(host: String, port: UInt16) throws {
+        var hints = addrinfo()
+        hints.ai_flags = AI_NUMERICHOST
+        hints.ai_socktype = SOCK_STREAM
+        var addresses: UnsafeMutablePointer<addrinfo>?
+        guard getaddrinfo(host, String(port), &hints, &addresses) == 0, let address = addresses else {
+            throw FixtureError(description: "couldn't resolve \(host)")
+        }
+        defer { freeaddrinfo(addresses) }
+        descriptor = socket(address.pointee.ai_family, SOCK_STREAM, 0)
+        var timeout = timeval(tv_sec: 5, tv_usec: 0) // A stalled server fails the test instead of hanging it.
+        setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        guard connect(descriptor, address.pointee.ai_addr, address.pointee.ai_addrlen) == 0 else {
+            let error = errno
+            close()
+            throw FixtureError(description: "couldn't connect to \(host): errno \(error)")
+        }
+    }
+
+    deinit {
+        close()
+    }
+
+    /// Sends a GET and reads the response head, returning the status code.
+    func get(_ path: String, range: String? = nil) throws -> Int {
+        var request = "GET \(path) HTTP/1.1\r\nHost: test\r\n"
+        if let range { request += "Range: \(range)\r\n" }
+        let bytes = Array((request + "\r\n").utf8)
+        guard Darwin.send(descriptor, bytes, bytes.count, 0) == bytes.count else {
+            throw FixtureError(description: "send failed: errno \(errno)")
+        }
+        let blankLine = Array("\r\n\r\n".utf8)
+        while true {
+            if let end = buffered.firstRange(of: blankLine) {
+                let statusLine = String(decoding: buffered[..<end.lowerBound], as: UTF8.self).prefix { $0 != "\r" }
+                buffered.removeSubrange(..<end.upperBound)
+                guard let status = statusLine.split(separator: " ").dropFirst().first.flatMap({ Int($0) }) else {
+                    throw FixtureError(description: "bad status line: \(statusLine)")
+                }
+                return status
+            }
+            try receive()
+        }
+    }
+
+    func readBody(_ count: Int) throws {
+        var remaining = count
+        while remaining > 0 {
+            if buffered.isEmpty { try receive() }
+            let taken = min(remaining, buffered.count)
+            buffered.removeFirst(taken)
+            remaining -= taken
+        }
+    }
+
+    func close() {
+        guard descriptor >= 0 else { return }
+        Darwin.close(descriptor)
+        descriptor = -1
+    }
+
+    private func receive() throws {
+        var chunk = [UInt8](repeating: 0, count: 1 << 16)
+        let count = recv(descriptor, &chunk, chunk.count, 0)
+        guard count > 0 else {
+            throw FixtureError(description: count == 0 ? "server closed the connection" : "recv failed: errno \(errno)")
+        }
+        buffered.append(contentsOf: chunk[..<count])
     }
 }

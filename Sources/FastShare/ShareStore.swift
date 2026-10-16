@@ -38,7 +38,8 @@ final class ShareStore {
     private(set) var addresses: [LocalAddress] = []
     private(set) var preferredInterface: String?
     private(set) var serverState: HTTPServer.State = .starting
-    private(set) var activeTransfers: [SharedFile.ID: Int] = [:]
+    /// Devices receiving each file right now.
+    private(set) var activeDevices: [SharedFile.ID: Int] = [:]
     var alert: ShareAlert?
 
     var isShowingAlert: Bool {
@@ -399,15 +400,12 @@ final class ShareStore {
 
     private func handle(_ event: HTTPServer.Event) {
         switch event {
-        case .transferStarted(let token):
-            activeTransfers[token, default: 0] += 1
-        case .transferFinished(let token, let completedFile):
-            let remaining = (activeTransfers[token] ?? 0) - 1
-            activeTransfers[token] = remaining > 0 ? remaining : nil
-            if completedFile, let index = files.firstIndex(where: { $0.token == token }) {
-                files[index].downloadCount += 1
-                saveLibrary()
-            }
+        case .devicesChanged(let token, let count):
+            activeDevices[token] = count > 0 ? count : nil
+        case .downloadCompleted(let token):
+            guard let index = files.firstIndex(where: { $0.token == token }) else { return }
+            files[index].downloadCount += 1
+            saveLibrary()
         }
     }
 
